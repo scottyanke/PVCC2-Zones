@@ -1,12 +1,9 @@
 /* ========================================================================================
- *  This specific program is for Wemos D1 Mini's used with Cypress PSOCs on the air handlers.
- *  It off loads all of the sensor processing to the PSOC, including talking to any modbus
- *  devices and DS18B20s for temperature readings.  The only purpose this Wemos (ESP8266) device
- *  serves is to communicate through the wifi guest network in the building to an mqtt server.
- *  The Wemos has one serial connection to the PSOC, and the network connections to the buildng
- *  wifi, but that's it.  Look to the PSOC Air Handler programs (one for MAX31855 and the other
- *  for MAX31865) to see all of the sensor connections.  Both PSOC types support the same kind
- *  of connection to the mqtt server.
+ *  This specific program is for Wemos D1 Mini's used to get temperature readings from DS18B20s,
+ *  or from smaller (dumber) devices that have HTU21Ds or their own DS18B20s, but happen to be
+ *  located in tunnels.
+ *  The only purpose this Wemos (ESP8266) device serves is to communicate through the wifi guest
+ *  network in the building to an mqtt server about what it knows.
  * ======================================================================================== */
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
