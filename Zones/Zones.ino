@@ -33,12 +33,13 @@
  *  EEPROM at version 1.0
  *  
  *  Executable segment sizes:
- *  IROM   : 301700          - code in flash         (default or ICACHE_FLASH_ATTR) 
+ *  IROM   : 302452          - code in flash         (default or ICACHE_FLASH_ATTR) 
  *  IRAM   : 28412   / 32768 - code in IRAM          (ICACHE_RAM_ATTR, ISRs...) 
  *  DATA   : 1276  )         - initialized variables (global, static) in RAM/HEAP 
- *  RODATA : 3376  ) / 81920 - constants             (global, static) in RAM/HEAP 
- *  BSS    : 27208 )         - zeroed variables      (global, static) in RAM/HEAP
+ *  RODATA : 3064  ) / 81920 - constants             (global, static) in RAM/HEAP 
+ *  BSS    : 27200 )         - zeroed variables      (global, static) in RAM/HEAP
  * ======================================================================================== */
+ADC_MODE(ADC_VCC)
 #include <Wire.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
@@ -52,13 +53,27 @@
 #include <DallasTemperature.h>
 
 #include "ModbusRtuX.h"   // Used for reading other devices with the modbus protocol over RS485
+// ModbusRtuX.h is a stripped down version of ModbusRtu.h.  It only has the procedures for the
+// master, and the functions for reading registers.  The original will work, but things like
+// the software serial are not needed, nor are the slave functions.  Just trying to save memory.
 
 // The standard time functions, including one for timezones.
 #include <TimeLib.h>
 #include <Timezone.h>
 bool time_was_set = false;
 uint16_t time_offset;
-
+/**
+ * This system keeps the time in UTC, and converts to local time on demand.  That way it can handle
+ * the Daylight Savings issues that pop up twice a year.  This works out well as it gets the time
+ * in UTC anyway...
+ */
+// US Central Time Zone (Chicago)
+// This next line sets the correct time offset for the start of Central Daylight Time, on the second Sunday of March at 2am
+TimeChangeRule myDST = {"CDT", Second, Sun, Mar, 2, -300};    // Daylight time = UTC - 5 hours
+// and the mySTD variable is set for Central Standard Time, which starts the first Sunday in November
+TimeChangeRule mySTD = {"CST", First, Sun, Nov, 2, -360};     // Standard time = UTC - 6 hours
+Timezone myTZ(myDST, mySTD);  // These are used so much that they might as well be global
+  
 // The EEPROM functions are used so that the Wemos can store configuration data in the event
 // of power failures.  Yes, there is one specifically for the ESP, but it parks the data all
 // over the place, and makes it difficult to read.
@@ -73,9 +88,12 @@ modbus_t telegram;
 const char VERSION[] = __DATE__ " " __TIME__;
 #define WIFI_SSID "my_ssid"
 #define WIFI_PASSWORD "the_ssid_password"
+#define ALT_WIFI_SSID "Poiuytrewq"
+#define ALT_WIFI_PASSWORD "sparky050504"
 #define WEBNAME "X"
 
 #define MQTT_HOST IPAddress(192, 168, 0, 104)
+#define ALT_MQTT_HOST IPAddress(192, 168, 0, 104)
 #define MQTT_PORT 1883
 // This program (device) publishes to the "Zones" subject on the mqtt server, versus the use of "AHU" by the air handlers.
 #define MQTT_NAME "Zones"
@@ -164,8 +182,10 @@ struct EEPROMStruct {
   char password[20] = "";
   IPAddress mqtt = IPAddress(0, 0, 0, 0);
   char webname[64] = "";
+  char debugging;
 } eeprom_data;
 
+uint8_t debugging_enabled;
 // The next two variables are used for obtaining the time from a trusted external web page.
 const char * headerKeys[] = {"date", "server"} ;
 const size_t numberOfHeaders = 2;
@@ -185,7 +205,6 @@ const char* serverIndex = "<form method='POST' action='/updateOTA' enctype='mult
 // which will also report the progress of the copy (using the -r) to the PC.  The bin file
 // would have been copied from the /tmp directory on the master machine.  Using a phone works great.
 //========================================================================================
-
 //========================================================================================
 // A small procedure to try to clean up memory leaks
 //========================================================================================
@@ -199,7 +218,17 @@ void tcpCleanup ()
     tcp_abort(tcp_tw_pcbs);
   }
 }
+// Trying to clean up issues with the hardware watchdog kicking in
+void hw_wdt_disable(){
+  *((volatile uint32_t*) 0x60000900) &= ~(1); // Hardware WDT OFF
+}
 
+void hw_wdt_enable(){
+  *((volatile uint32_t*) 0x60000900) |= 1; // Hardware WDT ON
+}
+void hw_wdt_reset(){
+ *((volatile uint32_t*) 0x60000914) = 0x73; 
+}
 //========================================================================================
 // The setup() procedure takes care of reading the eeprom for any stored data, like the
 // connection information and the address of the mqtt server, along with setting up the
@@ -218,6 +247,7 @@ void setup()
   WiFi.persistent(false); // Only change the current in-memory Wi-Fi settings, and does not affect the Wi-Fi settings stored in flash memory.
 
   Serial.begin(9600);     // All serial communications are at 9600,which is fine for what we are doing.
+  while (!Serial) {}      // Wait for OK
   Serial.setRxBufferSize(256);    // crank up the size of the RX buffer
   pinMode(D6,INPUT_PULLUP); // used for 1-wire
 
@@ -247,6 +277,7 @@ void setup()
       last_registers[j][i] = 0;   // used for comparing current to previous to limit updates
     }
 
+  ESP.wdtFeed();
   EEPROM.begin(512);  // try to get the connection info from EEPROM
   EEPROM.get(0,eeprom_data);
   if (!strcmp(eeprom_data.validate,"valid"))  // Is there a valid entry written in the EEPROM of this device
@@ -255,6 +286,7 @@ void setup()
     wifi_password = String(eeprom_data.password);
     mqtt_host = eeprom_data.mqtt;
     WebName = String(eeprom_data.webname);
+    debugging_enabled = eeprom_data.debugging;
   }
   else  // Default to the defines if the EEPROM has not yet been programmed.
   {
@@ -262,17 +294,20 @@ void setup()
     wifi_password = WIFI_PASSWORD;
     mqtt_host = MQTT_HOST;
     WebName = WEBNAME;
+    debugging_enabled = 0;
   }
   EEPROM.end();
-  mqttClient.setServer(mqtt_host, MQTT_PORT); // Set the name of the mqtt server.
   if (!ScanForWifi()) // This is a fallback because constantly remembering to change the EEPROM is a pain.
   {
-    wifi_ssid = "Poiuytrewq";
-    wifi_password = "sparky050504";
+    wifi_ssid = ALT_WIFI_SSID;
+    wifi_password = ALT_WIFI_PASSWORD;
+    mqtt_host = ALT_MQTT_HOST;
   }
+  mqttClient.setServer(mqtt_host, MQTT_PORT); // Set the name of the mqtt server.
 
   // Setup what to do with the various web pages used only for configuring/testing this device
   server.on(F("/config"), handleConfig); // if we are told to change the configuration, jump to that web page
+  server.on(F("/submit"), handleSubmit);
   server.on(F("/"), handleStatus);       // The most basic web request returns the status information
 
   // The update code is for doing OTA updates of this program.  Only /update is called by users.  The /updateOTA
@@ -286,7 +321,7 @@ void setup()
   {
     server.sendHeader(F("Connection"), "close");
     server.send(200, F("text/plain"), (Update.hasError()) ? "FAIL" : "OK");
-    delay(1000);
+    delay(1000);    // Show it for 1 second, then restart the ESP8266 using a software command
     ESP.restart();
   }, []() 
   {
@@ -305,7 +340,7 @@ void setup()
     delay(1);
   }); 
   server.begin();   // Start listening for connections to this devices AP.  Most of the time it's not needed, but helpful...
-  
+  ESP.wdtFeed();
   ds18b20s.begin();  // Start the sensors
 
   Wire.setClock(100000L);   // Only use a 100k clock frequency, the PCF8591 can't handle a higher speed
@@ -319,6 +354,7 @@ void setup()
     Wire.write(0xff);
     Wire.endTransmission();
   }
+  ESP.wdtFeed();  
   delay(50);
   Wire.beginTransmission(PCF8591_I2C); // The address of the PCF8591
   if (Wire.endTransmission () == 0)
@@ -333,7 +369,7 @@ void setup()
   PCF8591_wait = millis() + PCF8591_INTERVAL + (PCF8574_INTERVAL / 2);  // Offset this interval from the PCF8574
   
   getTimeFromHttp();  // get the time
-  last_hour = hour();
+  last_hour = 25;     // Use an invalid number just to initialize it.
   
   // This next chunk of code just gets the DS18B20s past the default 85C stage
   ds18b20s.requestTemperatures();
@@ -353,7 +389,7 @@ void setup()
 
   modbusClient.begin( 9600 ); // begin the ModBus object.
   modbusClient.setTimeOut( 2000 ); // if there is no answer in 2 seconds, roll over to the next
-  modbus_wait = millis() + 40000;   // wait 40 seconds from now before doing the first poll over modbus
+  modbus_wait = millis() + 60000;   // wait 60 seconds from now before doing the first poll over modbus
   modbus_state = 0;
   modbus_slave = 0;
   request_wait = millis() + TIME_BETWEEN_POLLING + 30000;   // offset the normal requests by an additional 30 seconds
@@ -361,26 +397,45 @@ void setup()
   read_time = millis();   // Realistically, the time since the first reboot (initially)
   time_offset = mac_address[5] * 128;   // Create a random interval for this device, based on its MAC address
 
-  delay(100);
-  mqttClient.setClientId(my_ssid);    // Used to keep things runnng with QOS 2
-
   // This is the end of the setup routine.  Posting the VERSION helps identify that everything really is at the same version throughout the building.
   sprintf(ts,"R|%03ld|Booted V.%s",(millis() + 499) / 1000,VERSION);
   add_to_queue(ts);   // tell the mqtt server that this device is up and running.  It isn't needed, but helpful.
-  sprintf(ts,"R|000|Boot reason was:%s",ESP.getResetReason().c_str());
-  add_to_queue(ts);
-  char ts1[45];
-  uint32_t heap_free;
-  uint16_t heap_max;
-  uint8_t heap_frag;
-  ESP.getHeapStats(&heap_free, &heap_max, &heap_frag);
-  sprintf(ts1,"R|000|Free heap is %ld",(long int)heap_free);
-  add_to_queue(ts1);
-  sprintf(ts1,"R|000|Heap fragmentation is %d%%",heap_frag);
-  add_to_queue(ts1);
-  sprintf(ts1,"R|000|MaxFreeBlockSize is %d",heap_max);
-  add_to_queue(ts1);
 
+  delay(100 + time_offset);     // Do a random delay at this time to ensure that not everything is read at the same time by multiple devices.
+                                // Note that this can add up to 32 seconds to the boot time, which is generally 6 seconds without this delay.
+  ESP.wdtFeed();
+  mqttClient.setClientId(my_ssid);    // Used to keep things runnng with QOS 2
+
+  if (debugging_enabled)
+  {
+    char ts1[45];
+    uint32_t heap_free;
+    uint16_t heap_max;
+    uint8_t heap_frag;
+    sprintf(ts,"R|000|Boot reason was:%s",ESP.getResetReason().c_str());
+    add_to_queue(ts);
+    sprintf(ts1,"R|000|Core Version %s",ESP.getCoreVersion().c_str());
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|SDK Version %s",ESP.getSdkVersion());
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|Boot Version %d",ESP.getBootVersion());
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|Boot mode %d",ESP.getBootMode());
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|CPU Freq %dMhz",ESP.getCpuFreqMHz());
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|VCC is %4.2f",((double)ESP.getVcc()/1000) * 1.1);
+    add_to_queue(ts1);
+    ESP.getHeapStats(&heap_free, &heap_max, &heap_frag);
+    sprintf(ts1,"R|000|Free heap is %zu",heap_free);
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|Heap fragmentation is %d%%",heap_frag);
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|MaxFreeBlockSize is %d",heap_max);
+    add_to_queue(ts1);
+    sprintf(ts1,"R|000|getFreeContStack is %zu",ESP.getFreeContStack());
+    add_to_queue(ts1);
+  }
   xmit_the_queue();   // xmit_the_queue() actually connects to the network, connects to the mqtt server, and sends the queued up data.
 }
 
@@ -399,31 +454,34 @@ time_t getTimeFromHttp()
   time_t tt;
 
   tt = 0;
-  add_to_queue((char *)"R|000|Getting the time");
+  if (debugging_enabled)
+    add_to_queue((char *)"R|000|Getting the time");
   connectToWifi();    // Connect to whatever guest network we are supposed to be on.
   if (WiFi.status() != WL_CONNECTED)  // If we couldn't connect through WiFi, then there's no point in continuing.
   {
     WiFi.disconnect();
     return 0;
   }
-  delay(1);
+  ESP.wdtFeed();
   http.begin(client,HTTP_TIME_SOURCE);   // A generally reliable place to get the date and time
-  http.setReuse(false);
+  http.setReuse(false);                  // Don't try to hang onto old web pages
   http.collectHeaders(headerKeys, numberOfHeaders);   // Just look at the headers
   httpCode = http.GET();
-  delay(1);
+  ESP.wdtFeed();
   if (httpCode > 0)
   {
+    headerDate.reserve(35);
     headerDate = http.header("date"); // We only want the date and time from the headers
     // headerDate looks like Sat, 19 Oct 2019 06:29:57 GMT
-    tt = timeElements(headerDate.c_str());   // set the date and time using what we got from the http request
-    add_to_queue((char *)"R|000|Got the time");
+    tt = timeElements((char *)headerDate.c_str());   // set the date and time using what we got from the http request
+    if (debugging_enabled)
+      add_to_queue((char *)"R|000|Got the time");
   }
   http.end();   // We are done with our HTTP request for about 24 hours
-  delay(100);
+  delay(100);   // The delays are necessary
   WiFi.disconnect();
   delay(100);
-  tcpCleanup();
+  tcpCleanup(); // Close any open connections
   return tt;
 }
 
@@ -432,31 +490,24 @@ time_t getTimeFromHttp()
 // format for setting the date and time within the Arduino program.  This takes a string
 // value from an HTTP header.
 //========================================================================================
-time_t timeElements(const char *str)
+time_t timeElements(char *str)
 {
   tmElements_t tm;
-  char t[80];
   int Year, Month, Day, Hour, Minute, Seconds, Wday ;
   int j;
   // An example of a time string to convert is - Sat, 19 Oct 2019 06:29:57 GMT
   char delimiters[] = " :,";    // Used to separate the date and time fields
   char* valPosition;
-  Year = 1970;
+  Year = 1970;    // Set some base default values
   Month = 1;
   Day = 1;
   Hour = 0;
   Minute = 0;
   Seconds = 0;
   Wday = 1;
-  // US Central Time Zone (Chicago)
-  // This next line sets the correct time offset for the start of Central Daylight Time, on the second Sunday of March at 2am
-  TimeChangeRule myDST = {"CDT", Second, Sun, Mar, 2, -300};    // Daylight time = UTC - 5 hours
-  // and the mySTD variable is set for Central Standard Time, which starts the first Sunday in November
-  TimeChangeRule mySTD = {"CST", First, Sun, Nov, 2, -360};     // Standard time = UTC - 6 hours
 
-  Timezone myTZ(myDST, mySTD);
-  strcpy(t,str);
-  valPosition = strtok(t, delimiters);
+//  Timezone myTZ(myDST, mySTD);
+  valPosition = strtok(str, delimiters);
   j = 0;
   while(valPosition != NULL){
     switch(j) {
@@ -512,8 +563,9 @@ time_t timeElements(const char *str)
   tm.Second = Seconds;
   tm.Wday = Wday;
 
-  delay(1);
-  setTime(myTZ.toLocal(makeTime(tm)));  // Call the myTX class to convert the date and time to the correct timezone, including daylight savings.
+  ESP.wdtFeed();
+  setTime(makeTime(tm));    // Set the system time to UTC
+  //setTime(myTZ.toLocal(makeTime(tm)));  // Call the myTZ class to convert the date and time to the correct timezone, including daylight savings.
   return makeTime(tm);
 }
 
@@ -523,7 +575,7 @@ time_t timeElements(const char *str)
 uint8_t ScanForWifi()
 {
   int n = WiFi.scanNetworks();  // Do a simple network check to see what's available.
-  if (n == 0)
+  if (!n)   // n is the number of APs found
   {
     ; // No wifi networks were found, which can happen in the tunnels.
     return(0);
@@ -555,6 +607,7 @@ void connectToWifi()
   {
     i++;
     delay(62);
+    ESP.wdtFeed();
   }
 
   delay(100);
@@ -570,8 +623,6 @@ void connectToWifi()
 //========================================================================================
 void getNewMqtt()   // gets a new mqtt server address if it changes by checking a web site
 {
-  char ts[128];
-  IPAddress ip;
 
   if (WebName.equalsIgnoreCase("X"))
     return;   // Nothing to get an address from, so return
@@ -595,6 +646,7 @@ void getNewMqtt()   // gets a new mqtt server address if it changes by checking 
       {
         String payload = http.getString();
         payload.trim();   // get rid of the trailing newline
+        IPAddress ip;
         ip.fromString(payload);
         if (ip[0] == 0 || ip[3] == 0) // is it a valid ip address?  Starting and ending with 0 generally aren't valid.
         {
@@ -605,6 +657,7 @@ void getNewMqtt()   // gets a new mqtt server address if it changes by checking 
         }
         if (mqtt_host != ip)  // check to see if the ip address changed
         {
+          char ts[64];
           sprintf(ts,"R|000|Changing the mqtt address to be %d.%d.%d.%d",ip[0], ip[1], ip[2], ip[3]);
           add_to_queue(ts);
           xmit_the_queue(); // Actually tell the old address
@@ -641,17 +694,16 @@ void getNewMqtt()   // gets a new mqtt server address if it changes by checking 
 //========================================================================================
 void add_to_queue(char* str)
 {
-  char ts[128];
-
   // Everything added to the queue has the same prefix and suffix
   // The my_ssid part is simply diagnostics, except in the case of the boiler monitor.
   if (strlen(str) > 90) // Just to keep the string within the required length
     return;
-  sprintf(ts, "%-6s|%04d-%02d-%02d %02d:%02d:%02d|%s|-|", my_ssid, year(), month(), day(), hour(), minute(), second(),str);
-  ts[QUEUE_WIDTH - 1] = '\0';   // This is a safety thing, to make sure each queue entry isn't longer than it should be
-  if (queue_len < (QUEUE_MAX))  // add to the queue if there is room
+  if (queue_len < (QUEUE_MAX - 1))  // add to the queue if there is room
   {
-    strcpy(queue+queue_pos,ts);
+    Timezone myTZ(myDST, mySTD);
+    time_t utc = now();
+    time_t t = myTZ.toLocal(utc);
+    sprintf(queue+queue_pos, "%-6s|%04d-%02d-%02d %02d:%02d:%02d|%s|-|", my_ssid, year(t), month(t), day(t), hour(t), minute(t), second(t),str);
     queue_pos += QUEUE_WIDTH;
     queue_len++;
   }
@@ -665,7 +717,6 @@ void add_to_queue(char* str)
 //========================================================================================
 void xmit_the_queue()
 {
-  char ts[128];
   uint8_t j;
   uint16_t queue_position;
 
@@ -674,7 +725,7 @@ void xmit_the_queue()
   connectToWifi();
   if (WiFi.status() != WL_CONNECTED)
     return;
-  delay(1);
+  ESP.wdtFeed();
   mqttClient.connect();   // Get connected to the mqtt server
   j = 0;
   while (!mqttClient.connected() && j < 200)  // give it up to 4 seconds to connect to mqtt
@@ -684,23 +735,23 @@ void xmit_the_queue()
   }
   if (mqttClient.connected() && queue_len)
   {
-    delay(1);
+    ESP.wdtFeed();
     queue_position = 0; // Used for getting info out of the queue FIFO, versus pulling from the end
     do
     {
       queue_len--;    // queue_len is the number of entries in the queue
-      strcpy(ts,queue + queue_position);
-      queue_position += QUEUE_WIDTH;
-      if (strlen(ts) > 0)
+      if (strlen(queue + queue_position) > 0)
       {
         // Message is being published with the 'Clean' session under QOS 2.
-        mqttClient.publish(MQTT_NAME, 2, true, ts);  // topic, qos, retain, payload, length=0, dup=false, message_id=0
+        mqttClient.publish(MQTT_NAME, 2, true, queue + queue_position);  // topic, qos, retain, payload, length=0, dup=false, message_id=0
         delay(250);   // We do have to wait for it to clear
       }
+      queue_position += QUEUE_WIDTH;
     } while (queue_len > 0);
     queue_pos = 0;    // reset the queue_pos for the next entries to be added to the queue in the future
     mqttClient.disconnect();
   };
+  ESP.wdtFeed();
   delay(500);   // this is important.  Don't remove this delay
   WiFi.disconnect();
   delay(250);
@@ -729,6 +780,7 @@ void loop()
   server.handleClient();    // used to handle configuration changes through the web interface
   if (hour() != last_hour && minute() > 56)   // At the end of each hour, do nothing for 3 minutes
   {
+    ESP.wdtFeed();
     return;   // Just loop around for the server side of things for three minutes
   }           // Don't even check the PCF9574, as much as it hurts not to.
 
@@ -742,7 +794,7 @@ void loop()
       }
       break;
     case 1:
-      delay(1);
+      ESP.wdtFeed();
       for (i = 0; i < MODBUS_REGISTERS; i++)
         registers[modbus_slave][i] = 0;
       telegram.u8id = 0x30 + modbus_slave; // slave address
@@ -755,7 +807,7 @@ void loop()
       modbus_slave++;   // set up for the next slave
       break;
     case 2:
-      delay(1);
+      ESP.wdtFeed();
       modbusClient.poll(); // check incoming messages
       if (modbusClient.getState() == COM_IDLE)  // COM_IDLE is after we've received our response
       {
@@ -763,7 +815,7 @@ void loop()
         modbus_state = 0;
         if (modbus_slave > (MODBUS_DEVICES - 1))
         {
-          modbus_wait = millis() + TIME_BETWEEN_POLLING;  // reset for the next loop
+          modbus_wait = millis() + TIME_BETWEEN_POLLING + time_offset;  // reset for the next loop
           modbus_slave = 0;
         }
       }
@@ -803,17 +855,24 @@ void loop()
       PCF8591_wait = millis() + PCF8591_INTERVAL;
       process_holding_registers(1);    // this queues up the data for mqtt by forcing an update
 
-      char ts1[45];
-      uint32_t heap_free;
-      uint16_t heap_max;
-      uint8_t heap_frag;
-      ESP.getHeapStats(&heap_free, &heap_max, &heap_frag);
-      sprintf(ts1,"R|000|Free heap is %ld",(long int)heap_free);
-      add_to_queue(ts1);
-      sprintf(ts1,"R|000|Heap fragmentation is %d%%",heap_frag);
-      add_to_queue(ts1);
-      sprintf(ts1,"R|000|MaxFreeBlockSize is %d",heap_max);
-      add_to_queue(ts1);
+      if (debugging_enabled)
+      {
+        char ts1[45];
+        uint32_t heap_free;
+        uint16_t heap_max;
+        uint8_t heap_frag;
+        ESP.wdtFeed();
+        ESP.getHeapStats(&heap_free, &heap_max, &heap_frag);
+        add_to_queue((char *)"R|000|______________________");
+        sprintf(ts1,"R|000|Free heap is %zu",heap_free);
+        add_to_queue(ts1);
+        sprintf(ts1,"R|000|Heap fragmentation is %d%%",heap_frag);
+        add_to_queue(ts1);
+        sprintf(ts1,"R|000|MaxFreeBlockSize is %d",heap_max);
+        add_to_queue(ts1);
+        sprintf(ts1,"R|000|getFreeContStack is %zu",ESP.getFreeContStack());
+        add_to_queue(ts1);
+      }
 
       xmit_the_queue();   // send all of the queued data to the mqtt server
     }
@@ -825,29 +884,32 @@ void loop()
       get_local_ds18b20s(0); // get the local stuff
       // process the holding registers from the polled devices
       process_holding_registers(0);   // don't force an update
-
       xmit_the_queue();   // if anything is queued up, send it off
     }
     
     // Things get interesting at 4am-ish.  It would be 2am, but then I'd have to deal with daylight savings at the same time
-    if (hour() == 4 && minute() > 20 && !time_was_set) // Get the time at 4am-ish, so we aren't too far off as time passes
+    time_t utc = now();
+    time_t t = myTZ.toLocal(utc);
+    if (hour(t) == 4 && minute(t) > 20 && !time_was_set) // Get the time at 4am-ish, so we aren't too far off as time passes
   	{  // The time_was_set variable is used so we only get the time once a day.
+      delay(time_offset * 2);
   	  if (!getTimeFromHttp())  // this gets the time
       {
         add_to_queue((char *)"E|000|Failed to get the time from HTTP");
         xmit_the_queue();
-        delay(10000);
+        delay(5000);
         ESP.restart();    // reboot because something is seriously wrong
       }
   	  time_was_set = true;  // say we got the 4am time so we don't loop around and try again immediately
   	}
-  	if (hour() < 1 && minute() > 30 && millis() > MILLIS_MAX) // Reboot every two or three days, due to a weird connection problem with the local network
+  	if (queue_len > (QUEUE_MAX * .75) || (hour(t) < 1 && minute(t) > 30 && millis() > MILLIS_MAX)) // Reboot every two or three days, due to a weird connection problem with the local network
     { // Two or three days means "only boot between 12:30am and 1am", which can stretch things out a bit.
+      add_to_queue((char *)"Booting due to connection issues");
       xmit_the_queue(); // flush out any hanging queued entries
-      delay(10000);     // make sure everything clears, then reboot
+      delay(5000);     // make sure everything clears, then reboot
       ESP.restart();    // As part of the restart, millis is reset to 0.
     }
-    if (hour() > 4)
+    if (hour(t) > 4)
 	    time_was_set = false; // after 4am it is ok to reset this flag.
      
   }  // end of if (modbus_state == 0)
@@ -857,7 +919,7 @@ void loop()
 //========================================================================================
 void process_holding_registers(uint8_t force)
 {
-  char temp_message[128];
+  char temp_message[32];
   uint8_t i,j,k;    
   float newTemp;
 
@@ -913,7 +975,7 @@ void process_holding_registers(uint8_t force)
 void printBinary(byte inByte, char *ts)
 {
   // if a pin is grounded (pulled low), then it is active, hence the '1'.  Pins left floating are low, the '0'
-  for (int b = 7; b >= 0; b--)
+  for (int b = 7; b >= 0; b--)  // Print the bits in MSB order.
   {
     if (bitRead(inByte, b))
     {
@@ -931,7 +993,6 @@ void printBinary(byte inByte, char *ts)
 //========================================================================================
 void read_pcf8574_pins(uint8_t forced)
 {
-  char pcf8574_message[128];
   char ts[9];
   uint8_t val;
 
@@ -941,6 +1002,7 @@ void read_pcf8574_pins(uint8_t forced)
   val = Wire.read();  // read all pins to see if any were pulled low
   if (val != lastPCF8574Value || forced)   // forced reads ignore whether the data has changed or not
   {
+    char pcf8574_message[16];
     printBinary((byte)val, ts);
     ts[8] = 0;
     sprintf(pcf8574_message, "P|000|%s", ts);
@@ -958,11 +1020,12 @@ void read_pcf8574_pins(uint8_t forced)
 //========================================================================================
 void read_pcf8591(uint8_t forced)
 {
-  char pcf8591_message[128];
-  float adcvalue;
-
   if (!pcf8591Found)
     return;
+
+  char pcf8591_message[24];
+  float adcvalue;
+
   Wire.beginTransmission(PCF8591_I2C);
   Wire.write(0x04); // Request a sequencial read of one pin after the latter
   Wire.endTransmission();
@@ -991,8 +1054,8 @@ void read_pcf8591(uint8_t forced)
 //========================================================================================
 void get_local_ds18b20s(uint8_t forced)
 {
-  char temp_message[128];
-  uint8_t sensor_address[8];
+  char temp_message[32];
+  uint8_t sensor_address[9];
   uint8_t sensor_index;
   float newTemp;
 
@@ -1028,7 +1091,7 @@ void get_local_ds18b20s(uint8_t forced)
 //========================================================================================
 void web_modbus()
 {
-  char temp_message[128];
+  char temp_message[32];
   uint8_t state;
   uint8_t slave;
   uint8_t i;
@@ -1082,7 +1145,7 @@ void web_modbus()
 //========================================================================================
 void web_process_holding_registers()
 {
-  char temp_message[128];
+  char temp_message[32];
   uint8_t i,j,k;    
   float newTemp;
 
@@ -1124,36 +1187,40 @@ void web_process_holding_registers()
 //========================================================================================
 void handleConfig() 
 {
-  char ts[200];
-  if (server.hasArg("ssid")&& server.hasArg("Password")&& server.hasArg("MQTT_IP")) //If all form fields contain data call handleSubmit()
-    handleSubmit();
-  else // Display the form
-  {
-    delay(1);
-    server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
-    server.sendHeader(F("Pragma"), F("no-cache"));
-    server.sendHeader(F("Expires"), "-1");
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    // here begin chunked transfer
-    server.send(200, "text/html");
-    server.sendContent(F("<!DOCTYPE HTML><html><head><meta content=\"text/html; charset=ISO-8859-1\" http-equiv=\"content-type\">" \
-        "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"));
-    server.sendContent(F("<title>Configuration</title><style>\"body { background-color: #808080; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\"</style></head>"));
-    server.sendContent(F("<body><h1>Configuration</h1><FORM action=\"/config\" method=\"post\">"));
-    sprintf(ts,"<P><label>SSID:&nbsp;</label><input maxlength=\"30\" value=\"%s\" name=\"ssid\"><br>",wifi_ssid.c_str());
-    server.sendContent(ts);
-    sprintf(ts,"<label>Password:&nbsp;</label><input maxlength=\"30\" value=\"%s\" name=\"Password\"><br>",wifi_password.c_str());
-    server.sendContent(ts);
-    sprintf(ts,"<label>MQTT IP:&nbsp;</label><input maxlength=\"15\" value=\"%d.%d.%d.%d\" name=\"MQTT_IP\"><br> ",mqtt_host[0],mqtt_host[1],mqtt_host[2],mqtt_host[3]);
-    server.sendContent(ts);
-    sprintf(ts,"<label>HTTP Web Name:&nbsp;</label><input maxlength=\"63\" value=\"%s\" name=\"WebName\"><br> ",WebName.c_str());
-    server.sendContent(ts);
-    server.sendContent(F("<INPUT type=\"submit\" value=\"Send\"> <INPUT type=\"reset\"></P>"));
-    sprintf(ts,"<P><br>I think the time is %04d-%02d-%02d %02d:%02d:%02d</P></FORM></body></html>",year(), month(), day(), hour(), minute(), second());
-    server.sendContent(ts);
-    delay(1);
-    server.client().stop();
-  }
+  char ts[80];
+  Timezone myTZ(myDST, mySTD);
+  time_t utc = now();
+  time_t t = myTZ.toLocal(utc);
+  // note that embedded in this form are lots of variable fields pre-filled with the sprintf
+  ESP.wdtFeed();
+  server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  server.sendHeader(F("Pragma"), F("no-cache"));
+  server.sendHeader(F("Expires"), "-1");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  // here begin chunked transfer
+  server.send(200, "text/html");
+  server.sendContent(F("<!DOCTYPE HTML><html><head><meta content=\"text/html; charset=ISO-8859-1\" http-equiv=\"content-type\">" \
+      "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"));
+  server.sendContent(F("<title>Configuration</title><style>\"body { background-color: #808080; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\"</style></head>"));
+  server.sendContent(F("<body><h1>Configuration</h1><FORM action=\"/submit\" method=\"post\">"));
+  sprintf(ts,"<P><label>SSID:&nbsp;</label><input maxlength=\"30\" value=\"%s\" name=\"ssid\"><br>",wifi_ssid.c_str());
+  server.sendContent(ts);
+  sprintf(ts,"<label>Password:&nbsp;</label><input maxlength=\"30\" value=\"%s\" name=\"Password\"><br>",wifi_password.c_str());
+  server.sendContent(ts);
+  sprintf(ts,"<label>MQTT IP:&nbsp;</label><input maxlength=\"15\" value=\"%d.%d.%d.%d\" name=\"MQTT_IP\"><br> ",mqtt_host[0],mqtt_host[1],mqtt_host[2],mqtt_host[3]);
+  server.sendContent(ts);
+  sprintf(ts,"<label>HTTP Web Name:&nbsp;</label><input maxlength=\"63\" value=\"%s\" name=\"WebName\"><br> ",WebName.c_str());
+  server.sendContent(ts);
+  if (debugging_enabled)
+    server.sendContent(F("<label>Enable debugging&nbsp;</label><input type=\"checkbox\" id=\"debugging\" name=\"enable_debug\" value=\"Debug\" checked=\"checked\"><br>"));
+  else
+    server.sendContent(F("<label>Enable debugging&nbsp;</label><input type=\"checkbox\" id=\"debugging\" name=\"enable_debug\" value=\"Debug\"><br>"));
+  server.sendContent(F("<INPUT type=\"submit\" value=\"Send\"> <INPUT type=\"reset\"></P>"));
+  sprintf(ts,"<P><br>The time is %04d-%02d-%02d %02d:%02d:%02d</P></FORM></body></html>",year(t), month(t), day(t), hour(t), minute(t), second(t));
+  server.sendContent(ts);
+  server.sendContent(""); // this closes out the send
+  ESP.wdtFeed();
+  server.client().stop();
 }
 
 //========================================================================================
@@ -1162,7 +1229,7 @@ void handleConfig()
 //========================================================================================
 void handleStatus()
 {
-  char ts[150];
+  char ts[72];
   uint16_t queue_length;
   uint16_t queue_position;
   int16_t last_read = (millis() - read_time) / 1000;
@@ -1170,8 +1237,11 @@ void handleStatus()
   uint8_t val;
   float adcvalue;
   uint8_t sensor_address[8];
+  Timezone myTZ(myDST, mySTD);
+  time_t utc = now();
+  time_t t = myTZ.toLocal(utc);
 
-  delay(1);
+  ESP.wdtFeed();
   modbus_state = 4;   // This is so we are exclusive while the web page is being processed
   server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
   server.sendHeader(F("Pragma"), F("no-cache"));
@@ -1179,7 +1249,7 @@ void handleStatus()
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   // here begin chunked transfer a line at a time
   server.send(200, "text/html");
-  delay(1);
+  ESP.wdtFeed();
   server.sendContent(F("<!DOCTYPE HTML><html><head><meta content=\"text/html; charset=ISO-8859-1\" http-equiv=\"content-type\">" \
       "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"));
   sprintf(ts,"<html><head><title>%s Status</title>",my_ssid);
@@ -1199,15 +1269,29 @@ void handleStatus()
   server.sendContent(ts);
   sprintf(ts,"There are %d queued entries.<br>",queue_len);
   server.sendContent(ts);
-  sprintf(ts,"Free heap is currently %ld<br>",(long int)ESP.getFreeHeap());
+  sprintf(ts,"Boot reason was:%s<br>",ESP.getResetReason().c_str());
+  server.sendContent(ts);
+  sprintf(ts,"Core Version %s<br>",ESP.getCoreVersion().c_str());
+  server.sendContent(ts);
+  sprintf(ts,"SDK Version %s<br>",ESP.getSdkVersion());
+  server.sendContent(ts);
+  sprintf(ts,"Boot Version %d<br>",ESP.getBootVersion());
+  server.sendContent(ts);
+  sprintf(ts,"Boot mode %d<br>",ESP.getBootMode());
+  server.sendContent(ts);
+  sprintf(ts,"CPU Freq %dMhz<br>",ESP.getCpuFreqMHz()); // Yes, I really don't need this, but since I'm here anyway...
+  server.sendContent(ts);
+  sprintf(ts,"VCC is %4.2f<br>",((double)ESP.getVcc()/1000) * 1.1);
+  server.sendContent(ts);
+  sprintf(ts,"Free heap is currently %zu<br>",ESP.getFreeHeap());
   server.sendContent(ts);
   sprintf(ts,"Heap fragmentation is %d<br>",ESP.getHeapFragmentation());
   server.sendContent(ts);
-  sprintf(ts,"MaxFreeBlockSize is %ld<br>",(long int)ESP.getMaxFreeBlockSize());
+  sprintf(ts,"MaxFreeBlockSize is %zu<br>",ESP.getMaxFreeBlockSize());
   server.sendContent(ts);
-  sprintf(ts,"I think the time is %04d-%02d-%02d %02d:%02d:%02d</P>", year(), month(), day(), hour(), minute(), second());
+  sprintf(ts,"I think the time is %04d-%02d-%02d %02d:%02d:%02d</P>", year(t), month(t), day(t), hour(t), minute(t), second(t));
   server.sendContent(ts);
-  delay(1);
+  ESP.wdtFeed();
   if (pcf8574Found)
   {
     Wire.requestFrom(PCF8574_I2C, 1);
@@ -1257,7 +1341,7 @@ void handleStatus()
   server.sendContent(F("All sensors have been read<br>"));
   server.sendContent(F("__________________________<br>"));
   server.sendContent(F("Reading the mqtt queue<br>"));
-  delay(1);
+  
   if (queue_len)
   {
     queue_length = queue_len;   // queue_length is just the copy within this procedure, vs queue_len, which is the global value
@@ -1275,6 +1359,7 @@ void handleStatus()
   
   server.sendContent(F("</body></html>"));
   server.sendContent(""); // this closes out the send
+  ESP.wdtFeed();
   server.client().stop();
   modbus_state = 0; // return things to normal
 }
@@ -1289,23 +1374,31 @@ void handleSubmit()
   int i;
   IPAddress ip;
   
-  String response="<!DOCTYPE HTML><html><head><meta content=\"text/html; charset=ISO-8859-1\" http-equiv=\"content-type\">" \
-      "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">";
-  response += "<p>The ssid is ";
-  response += server.arg("ssid");
-  response +="<br>";
-  response +="And the password is ";
-  response +=server.arg("Password");
-  response +="<br>";
-  response +="And the MQTT IP Address is ";
-  response +=server.arg("MQTT_IP");
-  response +="<br>";
-  response +="And the Web Name is ";
-  response +=server.arg("WebName");
-  response +="</P><BR>";
-  response +="<H2><a href=\"/\">go home</a></H2><br>";
+  server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  server.sendHeader(F("Pragma"), F("no-cache"));
+  server.sendHeader(F("Expires"), F("-1"));
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  // here begin chunked transfer a line at a time
+  server.send(200, "text/html");
+  delay(1);
+  server.sendContent(F("<!DOCTYPE HTML><html><head><meta content=\"text/html; charset=ISO-8859-1\" http-equiv=\"content-type\">" \
+      "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\"><html><head><title>"));
+  server.sendContent(my_ssid);
+  server.sendContent(F(" Status</title></head><body><p>The ssid is "));
+  server.sendContent(server.arg("ssid"));
+  server.sendContent(F("<br>And the password is "));
+  server.sendContent(server.arg("Password"));
+  server.sendContent(F("<br>And the MQTT IP Address is "));
+  server.sendContent(server.arg("MQTT_IP"));
+  server.sendContent(F("<br>And the Web Name is "));
+  server.sendContent(server.arg("WebName"));
+  if (server.arg("enable_debug") == "Debug")
+    server.sendContent(F("<br>Debugging enabled"));
+  server.sendContent(F("</P><BR><H2><a href=\"/\">go home</a></H2><br>"));
+  server.sendContent(F("</body></html>"));
+  server.sendContent(""); // this closes out the send
+  server.client().stop();
 
-  server.send(200, "text/html", response);
   // write data to EEPROM memory
   strcpy(eeprom_data.validate,"valid");
   i = server.arg("ssid").length() + 1;  // needed to make sure the correct length is used for the values
@@ -1316,11 +1409,15 @@ void handleSubmit()
   eeprom_data.mqtt = IPAddress(ip[0], ip[1], ip[2], ip[3]);
   i = server.arg("WebName").length() + 1;
   server.arg("WebName").toCharArray(eeprom_data.webname,i);
-  delay(1);
+  if (server.arg("enable_debug") == "Debug")
+    eeprom_data.debugging = 1;
+  else
+    eeprom_data.debugging = 0;
+  ESP.wdtFeed();
 
   EEPROM.begin(512);
   EEPROM.put(0,eeprom_data);
-  delay(1);
+  ESP.wdtFeed();
   EEPROM.commit();    // This is what actually forces the data to be written to EEPROM.
   EEPROM.end();
   delay(500);   // Wait for the eeprom to acually be written
@@ -1334,19 +1431,18 @@ void handleSubmit()
 //========================================================================================
 void handleNotFound()
 {
-  String message = "File Not Found\n\n";
-  message += "URI: ";
-  message += server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET)?"GET":"POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-  for (uint8_t i=0; i<server.args(); i++){
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
-  }
-  message +="<H2><a href=\"/\">go home</a></H2><br>";
-  server.send(404, "text/plain", message);
+  server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  server.sendHeader(F("Pragma"), F("no-cache"));
+  server.sendHeader(F("Expires"), F("-1"));
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  // here begin chunked transfer a line at a time
+  server.send(404, "text/html");
+  delay(1);
+  server.sendContent(F("File Not Found<br><br>URI:"));
+  server.sendContent(server.uri());
+  server.sendContent(F("</P><BR><H2><a href=\"/\">go home</a></H2><br>"));
+  server.sendContent(F("</body></html>"));
+  server.sendContent(""); // this closes out the send
   server.client().stop();
 }
 

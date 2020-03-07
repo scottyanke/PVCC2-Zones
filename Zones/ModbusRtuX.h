@@ -306,7 +306,7 @@ void Modbus::begin(long u32speed)
         digitalWrite(u8txenpin, LOW);
     }
 
-    while(port->read() >= 0);
+    while(port->read() >= 0) ESP.wdtFeed();
     u8lastRec = u8BufferSize = 0;
     u16InCnt = u16OutCnt = u16errCnt = 0;
 }
@@ -634,6 +634,7 @@ int8_t Modbus::getRxBuffer()
         u8BufferSize ++;
 
         if (u8BufferSize >= MAX_BUFFER) bBuffOverflow = true;
+        ESP.wdtFeed();
     }
     u16InCnt++;
 
@@ -687,7 +688,7 @@ void Modbus::sendTxBuffer()
         while ( u32overTimeCountDown-- > 0);
         digitalWrite( u8txenpin, LOW );
     }
-    while(port->read() >= 0);
+    while(port->read() >= 0) ESP.wdtFeed();
     u8BufferSize = 0;
     // set time-out for master
     u32timeOut = millis();
@@ -733,6 +734,7 @@ uint16_t Modbus::calcCRC(uint8_t u8length)
  * @return 0 if OK, EXCEPTION if anything fails
  * @ingroup buffer
  */
+ /*
 uint8_t Modbus::validateRequest()
 {
     // check message crc vs calculated crc
@@ -795,7 +797,7 @@ uint8_t Modbus::validateRequest()
     }
     return 0; // OK, no exception code thrown
 }
-
+*/
 /**
  * @brief
  * This method validates master incoming messages
