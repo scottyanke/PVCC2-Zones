@@ -1188,7 +1188,6 @@ void web_process_holding_registers()
 void handleConfig() 
 {
   char ts[80];
-  Timezone myTZ(myDST, mySTD);
   time_t utc = now();
   time_t t = myTZ.toLocal(utc);
   // note that embedded in this form are lots of variable fields pre-filled with the sprintf
@@ -1237,7 +1236,6 @@ void handleStatus()
   uint8_t val;
   float adcvalue;
   uint8_t sensor_address[8];
-  Timezone myTZ(myDST, mySTD);
   time_t utc = now();
   time_t t = myTZ.toLocal(utc);
 
